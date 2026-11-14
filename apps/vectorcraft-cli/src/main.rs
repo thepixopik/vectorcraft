@@ -684,12 +684,12 @@ fn run(args: &[String]) -> Result<(), String> {
                 scale = Some(raw.parse::<f64>().map_err(|_| format!("--scale {raw}: not a number"))?);
             }
             "--ppi" => {
-                let raw = val(\"a number\")?;
+                let raw = val("a number")?;
                 ppi = Some(
                     raw.parse::<f64>()
                         .ok()
-                        .filter(|n| n.is_finite() && *n > 0.0)
-                        .ok_or_else(|| format!(\"--ppi {raw}: needs a positive finite number\"))?,
+                        .filter(|n: &f64| n.is_finite() && *n > 0.0)
+                        .ok_or_else(|| format!("--ppi {raw}: needs a positive finite number"))?,
                 );
             }
             other => return Err(format!("unknown run option `{other}`")),
@@ -772,7 +772,8 @@ fn bench(args: &[String]) -> Result<(), String> {
     hl.call("app.open", json!({ "path": file })).map_err(|e| format!("open {file}: {e}"))?;
     let doc = hl.session.doc().map_err(|e| e.to_string())?.doc.clone();
     let b = doc.artboards.first().map(|a| a.rect).ok_or("document has no artboard")?;
-    let z = (w as f64 / b.width()).min(h as f64 / b.height()) * 0.95;\n    let view = vectorcraft_geom::Affine::translate((w as f64 / 2.0, h as f64 / 2.0))
+    let z = (w as f64 / b.width()).min(h as f64 / b.height()) * 0.95;
+    let view = vectorcraft_geom::Affine::translate((w as f64 / 2.0, h as f64 / 2.0))
         * vectorcraft_geom::Affine::scale(z)
         * vectorcraft_geom::Affine::translate(-b.center().to_vec2());
     let opts = vectorcraft_render::RenderOptions::default();
