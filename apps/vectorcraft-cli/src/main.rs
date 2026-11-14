@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! vectorcraft-cli --safe-mode SUBCOMMAND ...
-//! vectorcraft-cli mcp [--connect 127.0.0.1:7979 | --headless] [--automation-read-root DIR]... [--automation-write-root DIR]...
+//! vectorcraft-cli mcp [--connect 127.0.0.1:7979 | --headless | --http 0.0.0.0:8080] [--http-token TOKEN] [--automation-read-root DIR]... [--automation-write-root DIR]...
 //! vectorcraft-cli run [--in FILE] [--cmd id [--params '{json}'] | --commands FILE|-]... [--export out.svg]... [--scale 2] [--ppi 300]
 //! vectorcraft-cli commands
 //! vectorcraft-cli convert IN OUT [--scale 2] [--ppi 300] [--artboard 0 | --range 1-3,5] [--outline-text] [--decimals N] [--replace-lossy] [--editing-data] [--legacy-name-encoding ENC] [--preserve-editing] [--ai-version 7|pdf] [--hidden-objects layer|omit|visible] [--transparent-images flatten|omit]
@@ -78,8 +78,11 @@ USAGE:
       Safe Mode is on. Plug-ins stay installed. `--safe-mode mcp` serves a headless session and
       does not take --connect.
 
-  vectorcraft-cli mcp [--connect ADDR | --headless] [--automation-read-root DIR]... [--automation-write-root DIR]... [--allow-plugin-grants]
-      Run the MCP server on stdio. Default: connect to a running app at 127.0.0.1:7979
+  vectorcraft-cli mcp [--connect ADDR | --headless | --http ADDR] [--http-token TOKEN] [--automation-read-root DIR]... [--automation-write-root DIR]... [--allow-plugin-grants]
+      Run the MCP server on stdio, or over Streamable HTTP when --http ADDR (such as 0.0.0.0:8080)
+      is given (serving POST/DELETE /mcp and GET /health, with isolated headless sessions per
+      Mcp-Session-Id; --http-token or VECTORCRAFT_MCP_TOKEN requires Authorization: Bearer TOKEN).
+      Default on stdio: connect to a running app at 127.0.0.1:7979
       (vectorcraft --control 7979), falling back to a headless in-process session.
       --automation-read-root / --automation-write-root confine the files the agent's commands read
       (open, place, relink, library loads…) and write (save, export, package, library saves…) to
@@ -263,22 +266,25 @@ fn accepting_grants(mut h: Headless, allow: bool) -> Headless {
 /// `mcp`. With `--safe-mode` (`safe_mode`) it serves a headless session: a running app loads its own
 /// plug-ins, so `--connect` is refused and the default does not connect.
 fn mcp(args: &[String], safe_mode: bool) -> Result<(), String> {
-    if help_requested(args, &["--connect", "--automation-read-root", "--automation-write-root"]) {
+    if help_requested(args, &["--connect", "--http", "--http-token", "--automation-read-root", "--automation-write-root"]) {
         return help();
     }
     let mut connect: Option<String> = None;
+    let mut http: Option<String> = None;
+    let mut http_token: Option<String> = None;
     let mut headless = false;
     let mut allow_grants = false;
     let (mut read_roots, mut write_roots): (Vec<String>, Vec<String>) = (vec![], vec![]);
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        // The roots also come as `--flag=DIR`, as the other Craft apps take them.
         let (flag, inline) = match a.split_once('=') {
-            Some((f, v)) if f.starts_with("--automation-") => (f, Some(v.to_string())),
+            Some((f, v)) if f.starts_with("--automation-") || f == "--http" || f == "--http-token" => (f, Some(v.to_string())),
             _ => (a.as_str(), None),
         };
         match flag {
             "--connect" => connect = Some(it.next().cloned().ok_or("--connect needs an address")?),
+            "--http" => http = Some(inline.or_else(|| it.next().cloned()).ok_or("--http needs an address such as 0.0.0.0:8080")?),
+            "--http-token" => http_token = Some(inline.or_else(|| it.next().cloned()).ok_or("--http-token needs a token")?),
             "--headless" => headless = true,
             "--allow-plugin-grants" => allow_grants = true,
             "--automation-read-root" | "--automation-write-root" => {
@@ -287,6 +293,12 @@ fn mcp(args: &[String], safe_mode: bool) -> Result<(), String> {
             }
             other => return Err(format!("unknown mcp option `{other}`")),
         }
+    }
+    if http_token.is_some() && http.is_none() {
+        return Err("--http-token requires --http".into());
+    }
+    if http.is_some() && connect.is_some() {
+        return Err("use either --connect or --http: --http serves isolated headless sessions per client".into());
     }
     if headless && connect.is_some() {
         return Err("use either --connect or --headless".into());
@@ -306,6 +318,24 @@ fn mcp(args: &[String], safe_mode: bool) -> Result<(), String> {
     if roots.is_some() && connect.is_some() {
         return Err("--automation-read-root and --automation-write-root confine the headless server; a running app enforces its own roots: start it with `vectorcraft --control <port> --automation-read-root <dir> --automation-write-root <dir>`"
             .into());
+    }
+    if let Some(bind_addr) = http {
+        if let Some(r) = &roots {
+            file_access::confine_process(r.clone());
+            eprintln!("vectorcraft-cli: files confined: {}", r.describe());
+        }
+        vectorcraft_mcp::logging::install();
+        let auth_token = http_token.or_else(|| std::env::var("VECTORCRAFT_MCP_TOKEN").ok()).filter(|t| !t.is_empty());
+        let cfg = vectorcraft_mcp::http::HttpConfig { auth_token, ..Default::default() };
+        eprintln!("vectorcraft-cli: MCP Streamable HTTP server on http://{bind_addr}/mcp (headless)");
+        return vectorcraft_mcp::http::serve(&bind_addr, cfg, move || {
+            let h = match &roots {
+                Some(r) => accepting_grants(Headless::with_document().with_automation_roots(Some(r.clone())), allow_grants),
+                None => accepting_grants(with_stores(Headless::with_document()), allow_grants),
+            };
+            Ok(Box::new(h))
+        })
+        .map_err(|e| e.to_string());
     }
     let backend: Box<dyn Backend> = if let Some(roots) = roots {
         // Every thread of this process, not only the server's: nothing reaches past the roots.
