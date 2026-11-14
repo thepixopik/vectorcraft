@@ -17,6 +17,7 @@
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 /// `println!` / `print!` that end the program quietly when stdout is closed
 /// (`vectorcraft-cli commands | head`) instead of panicking with "failed printing to stdout:
@@ -263,9 +264,9 @@ fn accepting_grants(mut h: Headless, allow: bool) -> Headless {
     h
 }
 
-fn serve_http_mcp(bind_addr: &str, http_token: Option<String>, roots: Option<AutomationRoots>, allow_grants: bool) -> Result<(), String> {
+fn serve_http_mcp(bind_addr: &str, http_token: Option<String>, roots: Option<Arc<AutomationRoots>>, allow_grants: bool) -> Result<(), String> {
     if let Some(r) = &roots {
-        file_access::confine_process(r.clone());
+        file_access::confine_process(Arc::clone(r));
         eprintln!("vectorcraft-cli: files confined: {}", r.describe());
     }
     vectorcraft_mcp::logging::install();
@@ -274,10 +275,11 @@ fn serve_http_mcp(bind_addr: &str, http_token: Option<String>, roots: Option<Aut
     eprintln!("vectorcraft-cli: MCP Streamable HTTP server on http://{bind_addr}/mcp (headless)");
     vectorcraft_mcp::http::serve(bind_addr, cfg, move || {
         let h = match &roots {
-            Some(r) => accepting_grants(Headless::with_document().with_automation_roots(Some(r.clone())), allow_grants),
+            Some(r) => accepting_grants(Headless::with_document().with_automation_roots(Some(Arc::clone(r))), allow_grants),
             None => accepting_grants(with_stores(Headless::with_document()), allow_grants),
         };
-        Ok(Box::new(h))
+        let b: Box<dyn Backend> = Box::new(h);
+        Ok(b)
     })
     .map_err(|e| e.to_string())
 }
