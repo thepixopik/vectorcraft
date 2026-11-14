@@ -1,0 +1,220 @@
+name: Vectorize Character
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_source:
+        description: "HTTPS image URL or repo-relative path (PNG/WebP/JPG)"
+        required: true
+        type: string
+        default: "docs/images/art-pathfinder.png"
+      character_name:
+        description: "Output file stem (e.g. christmas-elf-01)"
+        required: true
+        type: string
+        default: "christmas-elf-01"
+      preset:
+        description: "VectorCraft Image Trace preset"
+        required: true
+        type: choice
+        default: "16 Colors"
+        options:
+          - "16 Colors"
+          - "6 Colors"
+          - "Auto Color"
+          - "Flat Logo"
+          - "High Fidelity Photo"
+          - "Low Fidelity Photo"
+          - "Black and White Logo"
+      colors:
+        description: "Optional palette color count override (2-256, blank keeps preset)"
+        required: false
+        type: string
+        default: "16"
+      ignore_white:
+        description: "Drop background and enclosed cutout color (face-frame hole)"
+        required: false
+        type: boolean
+        default: true
+      ignore_color:
+        description: "Optional hex chroma-key cutout color (#rrggbb, blank = white)"
+        required: false
+        type: string
+        default: ""
+      group_by_color:
+        description: "Group expanded vector paths by fill color"
+        required: false
+        type: boolean
+        default: true
+      upload_to_r2:
+        description: "Upload outputs to Cloudflare R2 (requires R2_* repo secrets)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  vectorize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore cached vectorcraft-cli binary
+        id: cli-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .bin-cache/vectorcraft-cli
+          key: ${{ runner.os }}-vectorcraft-cli-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'apps/vectorcraft-cli/**', 'crates/**') }}
+
+      - name: Build vectorcraft-cli (on cache miss)
+        if: steps.cli-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95 --profile minimal
+          rustup default 1.95
+          cargo build --locked --release -p vectorcraft-cli
+          mkdir -p .bin-cache
+          cp target/release/vectorcraft-cli .bin-cache/vectorcraft-cli
+          chmod +x .bin-cache/vectorcraft-cli
+
+      - name: Prepare input and run headless VectorCraft trace
+        shell: bash
+        env:
+          VECTORCRAFT_NO_PREFS: "1"
+          INPUT_SOURCE: ${{ inputs.image_source }}
+          CHARACTER_NAME: ${{ inputs.character_name }}
+          TRACE_PRESET: ${{ inputs.preset }}
+          TRACE_COLORS: ${{ inputs.colors }}
+          IGNORE_WHITE: ${{ inputs.ignore_white }}
+          IGNORE_COLOR: ${{ inputs.ignore_color }}
+          GROUP_BY_COLOR: ${{ inputs.group_by_color }}
+        run: |
+          set -euo pipefail
+          chmod +x .bin-cache/vectorcraft-cli
+          WORK_DIR="$(mktemp -d)"
+          OUT_DIR="${RUNNER_TEMP}/vectorcraft-out"
+          mkdir -p "$OUT_DIR"
+
+          SAFE_NAME="$(printf '%s' "$CHARACTER_NAME" | tr -cs 'A-Za-z0-9._-' '-' | sed 's/^-*//;s/-*$//')"
+          if [ -z "$SAFE_NAME" ]; then
+            SAFE_NAME="character-01"
+          fi
+
+          if [[ "$INPUT_SOURCE" =~ ^https:// ]]; then
+            EXT="png"
+            URL_PATH="${INPUT_SOURCE%%\?*}"
+            case "${URL_PATH,,}" in
+              *.webp) EXT="webp" ;;
+              *.jpg|*.jpeg) EXT="jpg" ;;
+              *.png) EXT="png" ;;
+              *.bmp) EXT="bmp" ;;
+              *.gif) EXT="gif" ;;
+              *.tif|*.tiff) EXT="tiff" ;;
+            esac
+            INPUT_FILE="${WORK_DIR}/input.${EXT}"
+            curl --fail --silent --show-error --location --max-time 60 --output "$INPUT_FILE" "$INPUT_SOURCE"
+          elif [ -f "$INPUT_SOURCE" ]; then
+            INPUT_FILE="$(realpath "$INPUT_SOURCE")"
+          else
+            echo "Input source must be an https:// URL or an existing repo-relative file path: $INPUT_SOURCE" >&2
+            exit 1
+          fi
+
+          STEPS_JSON="${WORK_DIR}/steps.json"
+          OUT_DIR="$OUT_DIR" SAFE_NAME="$SAFE_NAME" STEPS_JSON="$STEPS_JSON" python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          preset = os.environ["TRACE_PRESET"]
+          colors_raw = os.environ.get("TRACE_COLORS", "").strip()
+          ignore_white = os.environ.get("IGNORE_WHITE", "true").lower() == "true"
+          ignore_color = os.environ.get("IGNORE_COLOR", "").strip()
+          by_color = os.environ.get("GROUP_BY_COLOR", "true").lower() == "true"
+          out_dir = os.environ["OUT_DIR"]
+          safe_name = os.environ["SAFE_NAME"]
+
+          overrides = {
+              "ignoreWhite": ignore_white,
+              "ignoreBackground": False,
+          }
+          if by_color:
+              overrides["autoGrouping"] = False
+          if colors_raw:
+              colors_val = int(colors_raw)
+              if not (2 <= colors_val <= 256):
+                  raise SystemExit("colors must be between 2 and 256")
+              overrides["colors"] = colors_val
+          if ignore_color:
+              if not re.fullmatch(r"#[0-9a-fA-F]{6}", ignore_color):
+                  raise SystemExit("ignore_color must be a 6-digit hex color like #00ff00")
+              if preset.lower() != "flat logo":
+                  overrides["ignoreColor"] = ignore_color.lower()
+
+          trace_params = {
+              "preset": preset,
+              "byColor": by_color,
+              "params": overrides,
+          }
+
+          steps = [
+              {"command": "select.all", "params": {}},
+              {"command": "imageTrace.makeAndExpand", "params": trace_params},
+              {
+                  "command": "document.save",
+                  "params": {
+                      "path": os.path.join(out_dir, f"{safe_name}.vectorcraft"),
+                      "format": "vectorcraft",
+                  },
+              },
+          ]
+
+          with open(os.environ["STEPS_JSON"], "w", encoding="utf-8") as fh:
+              json.dump(steps, fh, indent=2)
+          PY
+
+          .bin-cache/vectorcraft-cli --safe-mode run \
+            --in "$INPUT_FILE" \
+            --commands "$STEPS_JSON" \
+            --export "${OUT_DIR}/${SAFE_NAME}.svg" \
+            --export "${OUT_DIR}/${SAFE_NAME}.pdf"
+
+          ls -lh "$OUT_DIR"
+
+      - name: Upload vectorized character artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vectorized-${{ inputs.character_name }}
+          path: ${{ runner.temp }}/vectorcraft-out/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload to Cloudflare R2 (optional)
+        if: inputs.upload_to_r2
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          CHARACTER_NAME: ${{ inputs.character_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$R2_ENDPOINT" ] || [ -z "$R2_BUCKET" ] || [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+            echo "R2_* repository secrets are required when upload_to_r2 is true." >&2
+            exit 1
+          fi
+          SAFE_NAME="$(printf '%s' "$CHARACTER_NAME" | tr -cs 'A-Za-z0-9._-' '-' | sed 's/^-*//;s/-*$//')"
+          aws s3 sync "${RUNNER_TEMP}/vectorcraft-out/" "s3://${R2_BUCKET}/characters/${SAFE_NAME}/" \
+            --endpoint-url "$R2_ENDPOINT"
