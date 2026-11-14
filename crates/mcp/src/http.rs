@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -51,6 +51,18 @@ impl Default for HttpConfig {
 enum EngineJob {
     Post { session_id: Option<String>, body: String, reply: SyncSender<HttpReply> },
     Delete { session_id: String, reply: SyncSender<HttpReply> },
+}
+
+struct HttpError {
+    status: u16,
+    reason: &'static str,
+    msg: &'static str,
+}
+
+impl HttpError {
+    const fn new(status: u16, reason: &'static str, msg: &'static str) -> Self {
+        Self { status, reason, msg }
+    }
 }
 
 struct HttpReply {
@@ -113,6 +125,8 @@ where
     F: FnMut() -> Result<Box<dyn Backend>, String>,
 {
     let (job_tx, job_rx) = sync_channel::<EngineJob>(JOB_QUEUE_CAP);
+    let idle_timeout = config.idle_timeout;
+    let max_sessions = config.max_sessions.max(1);
     let shared_cfg = Arc::new(config);
     let active_conns = Arc::new(AtomicUsize::new(0));
     let accept_stop = Arc::clone(&stop);
@@ -121,16 +135,11 @@ where
         let acceptor = scope.spawn(move || accept_loop(listener, shared_cfg, active_conns, accept_stop, job_tx));
         let mut sessions: HashMap<String, SessionEntry> = HashMap::new();
         while let Ok(job) = job_rx.recv() {
-            evict_expired(&mut sessions, shared_cfg_timeout(DEFAULT_IDLE_TIMEOUT, &sessions));
-            let reply = run_engine_job(&mut sessions, DEFAULT_MAX_SESSIONS.max(1), &mut make_backend, job);
-            let _ = reply;
+            evict_expired(&mut sessions, idle_timeout);
+            run_engine_job(&mut sessions, max_sessions, &mut make_backend, job);
         }
         acceptor.join().unwrap_or_else(|_| Err(std::io::Error::other("HTTP accept thread panicked")))
     })
-}
-
-fn shared_cfg_timeout(default_timeout: Duration, _sessions: &HashMap<String, SessionEntry>) -> Duration {
-    default_timeout
 }
 
 fn accept_loop(
@@ -172,9 +181,9 @@ fn handle_connection(stream: &mut TcpStream, config: &HttpConfig, job_tx: &SyncS
     let req = match read_http_request(stream) {
         Ok(Some(r)) => r,
         Ok(None) => return Ok(()),
-        Err((status, reason, msg)) => {
-            let body = serde_json::json!({ "error": msg }).to_string();
-            return write_http_reply(stream, &HttpReply::json(status, reason, None, body));
+        Err(err) => {
+            let body = serde_json::json!({ "error": err.msg }).to_string();
+            return write_http_reply(stream, &HttpReply::json(err.status, err.reason, None, body));
         }
     };
     let reply = dispatch_http_request(req, config, job_tx);
@@ -220,7 +229,7 @@ fn send_job(job_tx: &SyncSender<EngineJob>, build: impl FnOnce(SyncSender<HttpRe
     }
 }
 
-fn run_engine_job<F>(sessions: &mut HashMap<String, SessionEntry>, max_sessions: usize, make_backend: &mut F, job: EngineJob) -> Result<(), ()>
+fn run_engine_job<F>(sessions: &mut HashMap<String, SessionEntry>, max_sessions: usize, make_backend: &mut F, job: EngineJob)
 where
     F: FnMut() -> Result<Box<dyn Backend>, String>,
 {
@@ -234,7 +243,6 @@ where
             let _ = reply.send(http_reply);
         }
     }
-    Ok(())
 }
 
 fn handle_post<F>(
@@ -328,21 +336,22 @@ fn bearer_matches(auth_header: Option<&str>, expected_token: &str) -> bool {
     diff == 0
 }
 
-fn read_http_request(stream: &mut TcpStream) -> Result<Option<ParsedRequest>, (u16, &'static str, &'static str)> {
-    let cloned = stream.try_clone().map_err(|_| (500, "Internal Server Error", "stream clone failed"))?;
+fn read_http_request(stream: &mut TcpStream) -> Result<Option<ParsedRequest>, HttpError> {
+    let cloned = stream.try_clone().map_err(|_| HttpError::new(500, "Internal Server Error", "stream clone failed"))?;
     let mut reader = BufReader::new(cloned);
     let mut line_buf = Vec::new();
-    let has_first = read_line_capped(&mut reader, &mut line_buf, MAX_HEADER_LINE).map_err(|_| (400, "Bad Request", "failed reading request line"))?;
+    let has_first =
+        read_line_capped(&mut reader, &mut line_buf, MAX_HEADER_LINE).map_err(|_| HttpError::new(400, "Bad Request", "failed reading request line"))?;
     if !has_first {
         return Ok(None);
     }
     if line_buf.len() > MAX_HEADER_LINE {
-        return Err((431, "Request Header Fields Too Large", "request line too long"));
+        return Err(HttpError::new(431, "Request Header Fields Too Large", "request line too long"));
     }
-    let req_line = std::str::from_utf8(&line_buf).map_err(|_| (400, "Bad Request", "invalid UTF-8 in request line"))?;
+    let req_line = std::str::from_utf8(&line_buf).map_err(|_| HttpError::new(400, "Bad Request", "invalid UTF-8 in request line"))?;
     let mut parts = req_line.split_whitespace();
-    let method = parts.next().ok_or((400, "Bad Request", "missing HTTP method"))?.to_string();
-    let path = parts.next().ok_or((400, "Bad Request", "missing request target"))?.to_string();
+    let method = parts.next().ok_or_else(|| HttpError::new(400, "Bad Request", "missing HTTP method"))?.to_string();
+    let path = parts.next().ok_or_else(|| HttpError::new(400, "Bad Request", "missing request target"))?.to_string();
 
     let mut content_len: Option<usize> = None;
     let mut chunked = false;
@@ -350,23 +359,23 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Option<ParsedRequest>, (u
     let mut session_id: Option<String> = None;
 
     for _ in 0..MAX_HEADERS {
-        let ok = read_line_capped(&mut reader, &mut line_buf, MAX_HEADER_LINE).map_err(|_| (400, "Bad Request", "malformed headers"))?;
+        let ok = read_line_capped(&mut reader, &mut line_buf, MAX_HEADER_LINE).map_err(|_| HttpError::new(400, "Bad Request", "malformed headers"))?;
         if !ok || line_buf.is_empty() {
             let body = read_http_body(&mut reader, content_len, chunked)?;
             return Ok(Some(ParsedRequest { method, path, auth, session_id, body }));
         }
         if line_buf.len() > MAX_HEADER_LINE {
-            return Err((431, "Request Header Fields Too Large", "header too long"));
+            return Err(HttpError::new(431, "Request Header Fields Too Large", "header too long"));
         }
-        let header = std::str::from_utf8(&line_buf).map_err(|_| (400, "Bad Request", "invalid header encoding"))?;
+        let header = std::str::from_utf8(&line_buf).map_err(|_| HttpError::new(400, "Bad Request", "invalid header encoding"))?;
         let Some((name, val)) = header.split_once(':') else {
-            return Err((400, "Bad Request", "malformed header line"));
+            return Err(HttpError::new(400, "Bad Request", "malformed header line"));
         };
         let val = val.trim();
         if name.eq_ignore_ascii_case("content-length") {
-            let n = val.parse::<usize>().map_err(|_| (400, "Bad Request", "invalid Content-Length"))?;
+            let n = val.parse::<usize>().map_err(|_| HttpError::new(400, "Bad Request", "invalid Content-Length"))?;
             if n > MAX_LINE_BYTES {
-                return Err((413, "Payload Too Large", "request body exceeds 16 MiB limit"));
+                return Err(HttpError::new(413, "Payload Too Large", "request body exceeds 16 MiB limit"));
             }
             content_len = Some(n);
         } else if name.eq_ignore_ascii_case("transfer-encoding") && val.to_ascii_lowercase().contains("chunked") {
@@ -377,48 +386,52 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Option<ParsedRequest>, (u
             session_id = Some(val.to_string());
         }
     }
-    Err((431, "Request Header Fields Too Large", "too many HTTP headers"))
+    Err(HttpError::new(431, "Request Header Fields Too Large", "too many HTTP headers"))
 }
 
-fn read_http_body(reader: &mut impl BufRead, content_len: Option<usize>, chunked: bool) -> Result<String, (u16, &'static str, &'static str)> {
+fn read_http_body(reader: &mut impl BufRead, content_len: Option<usize>, chunked: bool) -> Result<String, HttpError> {
     let bytes = if chunked {
         read_chunked_body(reader)?
     } else if let Some(len) = content_len {
         let mut buf = vec![0u8; len];
-        reader.read_exact(&mut buf).map_err(|_| (400, "Bad Request", "truncated request body"))?;
+        std::io::Read::read_exact(reader, &mut buf).map_err(|_| HttpError::new(400, "Bad Request", "truncated request body"))?;
         buf
     } else {
         Vec::new()
     };
-    String::from_utf8(bytes).map_err(|_| (400, "Bad Request", "request body must be UTF-8"))
+    String::from_utf8(bytes).map_err(|_| HttpError::new(400, "Bad Request", "request body must be UTF-8"))
 }
 
-fn read_chunked_body(reader: &mut impl BufRead) -> Result<Vec<u8>, (u16, &'static str, &'static str)> {
+fn read_chunked_body(reader: &mut impl BufRead) -> Result<Vec<u8>, HttpError> {
     let mut out = Vec::new();
     let mut size_line = Vec::new();
     loop {
-        let ok = read_line_capped(reader, &mut size_line, 128).map_err(|_| (400, "Bad Request", "invalid chunk header"))?;
+        let ok = read_line_capped(reader, &mut size_line, 128).map_err(|_| HttpError::new(400, "Bad Request", "invalid chunk header"))?;
         if !ok || size_line.len() > 128 {
-            return Err((400, "Bad Request", "invalid chunk size line"));
+            return Err(HttpError::new(400, "Bad Request", "invalid chunk size line"));
         }
-        let raw = std::str::from_utf8(&size_line).map_err(|_| (400, "Bad Request", "invalid chunk size encoding"))?;
+        let raw = std::str::from_utf8(&size_line).map_err(|_| HttpError::new(400, "Bad Request", "invalid chunk size encoding"))?;
         let hex = raw.split(';').next().unwrap_or("").trim();
-        let chunk_len = usize::from_str_radix(hex, 16).map_err(|_| (400, "Bad Request", "bad chunk hex length"))?;
+        let chunk_len = usize::from_str_radix(hex, 16).map_err(|_| HttpError::new(400, "Bad Request", "bad chunk hex length"))?;
         if chunk_len == 0 {
             let _ = read_line_capped(reader, &mut size_line, MAX_HEADER_LINE);
             return Ok(out);
         }
         if out.len().saturating_add(chunk_len) > MAX_LINE_BYTES {
-            return Err((413, "Payload Too Large", "chunked body exceeds 16 MiB limit"));
+            return Err(HttpError::new(413, "Payload Too Large", "chunked body exceeds 16 MiB limit"));
         }
         let start = out.len();
         out.resize(start + chunk_len, 0);
         if let Some(slice) = out.get_mut(start..) {
-            reader.read_exact(slice).map_err(|_| (400, "Bad Request", "truncated chunk payload"))?;
+            std::io::Read::read_exact(slice_reader(reader), slice).map_err(|_| HttpError::new(400, "Bad Request", "truncated chunk payload"))?;
         }
         let mut crlf = [0u8; 2];
-        reader.read_exact(&mut crlf).map_err(|_| (400, "Bad Request", "missing chunk CRLF"))?;
+        std::io::Read::read_exact(reader, &mut crlf).map_err(|_| HttpError::new(400, "Bad Request", "missing chunk CRLF"))?;
     }
+}
+
+fn slice_reader<R: BufRead>(reader: &mut R) -> &mut R {
+    reader
 }
 
 fn write_http_reply(stream: &mut impl Write, reply: &HttpReply) -> std::io::Result<()> {
@@ -446,6 +459,7 @@ fn write_http_reply(stream: &mut impl Write, reply: &HttpReply) -> std::io::Resu
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
@@ -478,8 +492,6 @@ mod tests {
         (status, headers, body.to_string())
     }
 
-    use std::collections::HashMap;
-
     #[test]
     fn streamable_http_session_preserves_document_state_and_auth() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -490,18 +502,15 @@ mod tests {
 
         let handle = std::thread::spawn(move || serve_until(listener, cfg, stop_bg, || Ok(Box::new(Headless::with_document()))));
 
-        // 1. Health check works without auth.
         let (status, _, body) = send_raw(addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
         assert_eq!(status, 200);
         assert!(body.contains("\"ok\":true"));
 
-        // 2. Unauthorized /mcp request is rejected.
         let init_body = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}).to_string();
         let unauth_req = format!("POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{init_body}", init_body.len());
         let (status, _, _) = send_raw(addr, &unauth_req);
         assert_eq!(status, 401);
 
-        // 3. Initialize creates an Mcp-Session-Id.
         let auth_init = format!(
             "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret-token\r\nContent-Length: {}\r\n\r\n{init_body}",
             init_body.len()
@@ -512,7 +521,6 @@ mod tests {
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["result"]["serverInfo"]["name"], "vectorcraft");
 
-        // 4. Notification returns 202 Accepted.
         let notif = json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string();
         let notif_req = format!(
             "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret-token\r\nMcp-Session-Id: {sid}\r\nContent-Length: {}\r\n\r\n{notif}",
@@ -522,7 +530,6 @@ mod tests {
         assert_eq!(status, 202);
         assert!(body.is_empty());
 
-        // 5. Draw a shape in this session and verify it persists in the next HTTP request.
         let draw = json!({
             "jsonrpc": "2.0",
             "id": 2,
@@ -546,12 +553,10 @@ mod tests {
         assert_eq!(status, 200);
         assert!(body.contains("120"));
 
-        // 6. DELETE closes the session cleanly.
         let del_req = format!("DELETE /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret-token\r\nMcp-Session-Id: {sid}\r\n\r\n");
         let (status, _, _) = send_raw(addr, &del_req);
         assert_eq!(status, 204);
 
-        // Shut down listener cleanly.
         stop.store(true, Ordering::Release);
         let _ = TcpStream::connect(addr);
         handle.join().unwrap().unwrap();

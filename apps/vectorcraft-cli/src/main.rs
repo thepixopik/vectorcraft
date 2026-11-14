@@ -263,6 +263,25 @@ fn accepting_grants(mut h: Headless, allow: bool) -> Headless {
     h
 }
 
+fn serve_http_mcp(bind_addr: &str, http_token: Option<String>, roots: Option<AutomationRoots>, allow_grants: bool) -> Result<(), String> {
+    if let Some(r) = &roots {
+        file_access::confine_process(r.clone());
+        eprintln!("vectorcraft-cli: files confined: {}", r.describe());
+    }
+    vectorcraft_mcp::logging::install();
+    let auth_token = http_token.or_else(|| std::env::var("VECTORCRAFT_MCP_TOKEN").ok()).filter(|t| !t.is_empty());
+    let cfg = vectorcraft_mcp::http::HttpConfig { auth_token, ..Default::default() };
+    eprintln!("vectorcraft-cli: MCP Streamable HTTP server on http://{bind_addr}/mcp (headless)");
+    vectorcraft_mcp::http::serve(bind_addr, cfg, move || {
+        let h = match &roots {
+            Some(r) => accepting_grants(Headless::with_document().with_automation_roots(Some(r.clone())), allow_grants),
+            None => accepting_grants(with_stores(Headless::with_document()), allow_grants),
+        };
+        Ok(Box::new(h))
+    })
+    .map_err(|e| e.to_string())
+}
+
 /// `mcp`. With `--safe-mode` (`safe_mode`) it serves a headless session: a running app loads its own
 /// plug-ins, so `--connect` is refused and the default does not connect.
 fn mcp(args: &[String], safe_mode: bool) -> Result<(), String> {
@@ -320,22 +339,7 @@ fn mcp(args: &[String], safe_mode: bool) -> Result<(), String> {
             .into());
     }
     if let Some(bind_addr) = http {
-        if let Some(r) = &roots {
-            file_access::confine_process(r.clone());
-            eprintln!("vectorcraft-cli: files confined: {}", r.describe());
-        }
-        vectorcraft_mcp::logging::install();
-        let auth_token = http_token.or_else(|| std::env::var("VECTORCRAFT_MCP_TOKEN").ok()).filter(|t| !t.is_empty());
-        let cfg = vectorcraft_mcp::http::HttpConfig { auth_token, ..Default::default() };
-        eprintln!("vectorcraft-cli: MCP Streamable HTTP server on http://{bind_addr}/mcp (headless)");
-        return vectorcraft_mcp::http::serve(&bind_addr, cfg, move || {
-            let h = match &roots {
-                Some(r) => accepting_grants(Headless::with_document().with_automation_roots(Some(r.clone())), allow_grants),
-                None => accepting_grants(with_stores(Headless::with_document()), allow_grants),
-            };
-            Ok(Box::new(h))
-        })
-        .map_err(|e| e.to_string());
+        return serve_http_mcp(&bind_addr, http_token, roots, allow_grants);
     }
     let backend: Box<dyn Backend> = if let Some(roots) = roots {
         // Every thread of this process, not only the server's: nothing reaches past the roots.
@@ -680,12 +684,12 @@ fn run(args: &[String]) -> Result<(), String> {
                 scale = Some(raw.parse::<f64>().map_err(|_| format!("--scale {raw}: not a number"))?);
             }
             "--ppi" => {
-                let raw = val("a number")?;
+                let raw = val(\"a number\")?;
                 ppi = Some(
                     raw.parse::<f64>()
                         .ok()
                         .filter(|n| n.is_finite() && *n > 0.0)
-                        .ok_or_else(|| format!("--ppi {raw}: needs a positive finite number"))?,
+                        .ok_or_else(|| format!(\"--ppi {raw}: needs a positive finite number\"))?,
                 );
             }
             other => return Err(format!("unknown run option `{other}`")),
@@ -768,8 +772,7 @@ fn bench(args: &[String]) -> Result<(), String> {
     hl.call("app.open", json!({ "path": file })).map_err(|e| format!("open {file}: {e}"))?;
     let doc = hl.session.doc().map_err(|e| e.to_string())?.doc.clone();
     let b = doc.artboards.first().map(|a| a.rect).ok_or("document has no artboard")?;
-    let z = (w as f64 / b.width()).min(h as f64 / b.height()) * 0.95;
-    let view = vectorcraft_geom::Affine::translate((w as f64 / 2.0, h as f64 / 2.0))
+    let z = (w as f64 / b.width()).min(h as f64 / b.height()) * 0.95;\n    let view = vectorcraft_geom::Affine::translate((w as f64 / 2.0, h as f64 / 2.0))
         * vectorcraft_geom::Affine::scale(z)
         * vectorcraft_geom::Affine::translate(-b.center().to_vec2());
     let opts = vectorcraft_render::RenderOptions::default();
