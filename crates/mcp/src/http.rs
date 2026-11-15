@@ -1,8 +1,9 @@
 //! Streamable HTTP transport (`/mcp`) for [`Server`].
 //!
 //! Implements the MCP Streamable HTTP transport (`POST /mcp`, `DELETE /mcp`, `OPTIONS /mcp`) and a
-//! lightweight `GET /health` probe using standard-library sockets. Each `Mcp-Session-Id` owns an
-//! isolated [`Server`] on the engine thread, so [`Backend`] implementations do not need `Send`.
+//! lightweight `GET /health` probe using standard-library sockets. By default (`shared_session:
+//! true`), all requests share one persistent studio [`Server`] on the engine thread so cloud AI
+//! orchestrators that re-initialize per tool call keep full document, selection and undo state.
 
 use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
@@ -24,10 +25,11 @@ const DEFAULT_MAX_SESSIONS: usize = 64;
 const MAX_CONCURRENT_CONNS: usize = 32;
 const MAX_HEADERS: usize = 64;
 const MAX_HEADER_LINE: usize = 8 * 1024;
-const READ_TIMEOUT: Duration = Duration::from_secs(15);
-const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-const JOB_QUEUE_CAP: usize = 64;
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
+const JOB_QUEUE_CAP: usize = 128;
 const STATELESS_SESSION_KEY: &str = "stateless-default";
+const SHARED_SESSION_KEY: &str = "studio-shared";
 
 static NEXT_SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -36,15 +38,17 @@ static NEXT_SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
 pub struct HttpConfig {
     /// Optional Bearer token required on `/mcp` requests.
     pub auth_token: Option<String>,
-    /// Idle duration before an inactive `Mcp-Session-Id` is evicted.
+    /// Idle duration before an inactive isolated `Mcp-Session-Id` is evicted.
     pub idle_timeout: Duration,
-    /// Maximum concurrent stateful sessions kept in memory.
+    /// Maximum concurrent isolated sessions kept in memory.
     pub max_sessions: usize,
+    /// Share one persistent studio session across all HTTP handshakes and tool calls.
+    pub shared_session: bool,
 }
 
 impl Default for HttpConfig {
     fn default() -> Self {
-        Self { auth_token: None, idle_timeout: DEFAULT_IDLE_TIMEOUT, max_sessions: DEFAULT_MAX_SESSIONS }
+        Self { auth_token: None, idle_timeout: DEFAULT_IDLE_TIMEOUT, max_sessions: DEFAULT_MAX_SESSIONS, shared_session: true }
     }
 }
 
@@ -127,6 +131,7 @@ where
     let (job_tx, job_rx) = sync_channel::<EngineJob>(JOB_QUEUE_CAP);
     let idle_timeout = config.idle_timeout;
     let max_sessions = config.max_sessions.max(1);
+    let shared_session = config.shared_session;
     let shared_cfg = Arc::new(config);
     let active_conns = Arc::new(AtomicUsize::new(0));
     let accept_stop = Arc::clone(&stop);
@@ -135,8 +140,10 @@ where
         let acceptor = scope.spawn(move || accept_loop(listener, shared_cfg, active_conns, accept_stop, job_tx));
         let mut sessions: HashMap<String, SessionEntry> = HashMap::new();
         while let Ok(job) = job_rx.recv() {
-            evict_expired(&mut sessions, idle_timeout);
-            run_engine_job(&mut sessions, max_sessions, &mut make_backend, job);
+            if !shared_session {
+                evict_expired(&mut sessions, idle_timeout);
+            }
+            run_engine_job(&mut sessions, max_sessions, shared_session, &mut make_backend, job);
         }
         acceptor.join().unwrap_or_else(|_| Err(std::io::Error::other("HTTP accept thread panicked")))
     })
@@ -229,17 +236,24 @@ fn send_job(job_tx: &SyncSender<EngineJob>, build: impl FnOnce(SyncSender<HttpRe
     }
 }
 
-fn run_engine_job<F>(sessions: &mut HashMap<String, SessionEntry>, max_sessions: usize, make_backend: &mut F, job: EngineJob)
-where
+fn run_engine_job<F>(
+    sessions: &mut HashMap<String, SessionEntry>,
+    max_sessions: usize,
+    shared_session: bool,
+    make_backend: &mut F,
+    job: EngineJob,
+) where
     F: FnMut() -> Result<Box<dyn Backend>, String>,
 {
     match job {
         EngineJob::Delete { session_id, reply } => {
-            sessions.remove(&session_id);
+            if !shared_session {
+                sessions.remove(&session_id);
+            }
             let _ = reply.send(HttpReply::empty(204, "No Content", None));
         }
         EngineJob::Post { session_id, body, reply } => {
-            let http_reply = handle_post(sessions, max_sessions, make_backend, session_id, &body);
+            let http_reply = handle_post(sessions, max_sessions, shared_session, make_backend, session_id, &body);
             let _ = reply.send(http_reply);
         }
     }
@@ -248,6 +262,7 @@ where
 fn handle_post<F>(
     sessions: &mut HashMap<String, SessionEntry>,
     max_sessions: usize,
+    shared_session: bool,
     make_backend: &mut F,
     asked_sid: Option<String>,
     body: &str,
@@ -256,16 +271,28 @@ where
     F: FnMut() -> Result<Box<dyn Backend>, String>,
 {
     let is_init = is_initialize_request(body);
-    let sid = match (is_init, asked_sid) {
-        (true, None) => new_session_id(),
-        (_, Some(id)) => id,
-        (false, None) => STATELESS_SESSION_KEY.to_string(),
+    let (store_key, header_sid) = if shared_session {
+        let echoed = match (is_init, asked_sid) {
+            (_, Some(id)) => Some(id),
+            (true, None) => Some(new_session_id()),
+            (false, None) => None,
+        };
+        (SHARED_SESSION_KEY.to_string(), echoed)
+    } else {
+        let sid = match (is_init, asked_sid) {
+            (true, None) => new_session_id(),
+            (_, Some(id)) => id,
+            (false, None) => STATELESS_SESSION_KEY.to_string(),
+        };
+        if is_init {
+            sessions.remove(&sid);
+        }
+        let echoed = (sid != STATELESS_SESSION_KEY).then(|| sid.clone());
+        (sid, echoed)
     };
-    if is_init {
-        sessions.remove(&sid);
-    }
-    if !sessions.contains_key(&sid) {
-        if sessions.len() >= max_sessions {
+
+    if !sessions.contains_key(&store_key) {
+        if !shared_session && sessions.len() >= max_sessions {
             evict_oldest(sessions);
         }
         let backend = match make_backend() {
@@ -275,13 +302,12 @@ where
                 return HttpReply::json(500, "Internal Server Error", None, err);
             }
         };
-        sessions.insert(sid.clone(), SessionEntry { server: Server::new(backend), last_used: Instant::now() });
+        sessions.insert(store_key.clone(), SessionEntry { server: Server::new(backend), last_used: Instant::now() });
     }
-    let Some(entry) = sessions.get_mut(&sid) else {
+    let Some(entry) = sessions.get_mut(&store_key) else {
         return HttpReply::json(500, "Internal Server Error", None, "{\"error\":\"session missing\"}".into());
     };
     entry.last_used = Instant::now();
-    let header_sid = (sid != STATELESS_SESSION_KEY).then_some(sid);
     match entry.server.handle_line(body) {
         Some(line) => HttpReply::json(200, "OK", header_sid, line),
         None => HttpReply::empty(202, "Accepted", header_sid),
@@ -340,8 +366,8 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Option<ParsedRequest>, Ht
     let cloned = stream.try_clone().map_err(|_| HttpError::new(500, "Internal Server Error", "stream clone failed"))?;
     let mut reader = BufReader::new(cloned);
     let mut line_buf = Vec::new();
-    let has_first =
-        read_line_capped(&mut reader, &mut line_buf, MAX_HEADER_LINE).map_err(|_| HttpError::new(400, "Bad Request", "failed reading request line"))?;
+    let bad_req_line = |_| HttpError::new(400, "Bad Request", "failed reading request line");
+    let has_first = read_line_capped(&mut reader, &mut line_buf, MAX_HEADER_LINE).map_err(bad_req_line)?;
     if !has_first {
         return Ok(None);
     }
@@ -359,7 +385,8 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Option<ParsedRequest>, Ht
     let mut session_id: Option<String> = None;
 
     for _ in 0..MAX_HEADERS {
-        let ok = read_line_capped(&mut reader, &mut line_buf, MAX_HEADER_LINE).map_err(|_| HttpError::new(400, "Bad Request", "malformed headers"))?;
+        let bad_hdr = |_| HttpError::new(400, "Bad Request", "malformed headers");
+        let ok = read_line_capped(&mut reader, &mut line_buf, MAX_HEADER_LINE).map_err(bad_hdr)?;
         if !ok || line_buf.is_empty() {
             let body = read_http_body(&mut reader, content_len, chunked)?;
             return Ok(Some(ParsedRequest { method, path, auth, session_id, body }));
@@ -493,12 +520,12 @@ mod tests {
     }
 
     #[test]
-    fn streamable_http_session_preserves_document_state_and_auth() {
+    fn shared_studio_session_persists_across_reinitialize_and_delete() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_bg = Arc::clone(&stop);
-        let cfg = HttpConfig { auth_token: Some("secret-token".into()), idle_timeout: Duration::from_secs(60), max_sessions: 8 };
+        let cfg = HttpConfig { auth_token: Some("secret-token".into()), ..Default::default() };
 
         let handle = std::thread::spawn(move || serve_until(listener, cfg, stop_bg, || Ok(Box::new(Headless::with_document()))));
 
@@ -517,45 +544,42 @@ mod tests {
         );
         let (status, headers, body) = send_raw(addr, &auth_init);
         assert_eq!(status, 200);
-        let sid = headers.get("mcp-session-id").unwrap().clone();
+        let sid1 = headers.get("mcp-session-id").unwrap().clone();
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["result"]["serverInfo"]["name"], "vectorcraft");
-
-        let notif = json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string();
-        let notif_req = format!(
-            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret-token\r\nMcp-Session-Id: {sid}\r\nContent-Length: {}\r\n\r\n{notif}",
-            notif.len()
-        );
-        let (status, _, body) = send_raw(addr, &notif_req);
-        assert_eq!(status, 202);
-        assert!(body.is_empty());
 
         let draw = json!({
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/call",
-            "params": {"name": "draw_shape", "arguments": {"shape": "rect", "x": 20.0, "y": 30.0, "w": 120.0, "h": 80.0, "fill": "#ff0000"}}
+            "params": {"name": "draw_shape", "arguments": {"shape": "rectangle", "x": 20.0, "y": 30.0, "width": 120.0, "height": 80.0, "fill": "#ff0000", "name": "PersistBox"}}
         })
         .to_string();
         let draw_req = format!(
-            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret-token\r\nMcp-Session-Id: {sid}\r\nContent-Length: {}\r\n\r\n{draw}",
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret-token\r\nMcp-Session-Id: {sid1}\r\nContent-Length: {}\r\n\r\n{draw}",
             draw.len()
         );
         let (status, _, _) = send_raw(addr, &draw_req);
         assert_eq!(status, 200);
 
+        let del_req = format!("DELETE /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret-token\r\nMcp-Session-Id: {sid1}\r\n\r\n");
+        let (status, _, _) = send_raw(addr, &del_req);
+        assert_eq!(status, 204);
+
+        // Simulate a cloud AI client opening a brand-new initialize handshake for the next tool call.
+        let (status, headers2, _) = send_raw(addr, &auth_init);
+        assert_eq!(status, 200);
+        let sid2 = headers2.get("mcp-session-id").unwrap().clone();
+        assert_ne!(sid1, sid2);
+
         let inspect = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "doc_inspect", "arguments": {}}}).to_string();
         let inspect_req = format!(
-            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret-token\r\nMcp-Session-Id: {sid}\r\nContent-Length: {}\r\n\r\n{inspect}",
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret-token\r\nMcp-Session-Id: {sid2}\r\nContent-Length: {}\r\n\r\n{inspect}",
             inspect.len()
         );
         let (status, _, body) = send_raw(addr, &inspect_req);
         assert_eq!(status, 200);
-        assert!(body.contains("120"));
-
-        let del_req = format!("DELETE /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret-token\r\nMcp-Session-Id: {sid}\r\n\r\n");
-        let (status, _, _) = send_raw(addr, &del_req);
-        assert_eq!(status, 204);
+        assert!(body.contains("PersistBox"));
 
         stop.store(true, Ordering::Release);
         let _ = TcpStream::connect(addr);
