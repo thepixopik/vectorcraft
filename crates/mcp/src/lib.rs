@@ -1,6 +1,6 @@
 //! VectorCraft's MCP server.
 //!
-//! [Model Context Protocol](https://modelcontextprotocol.io) over stdio: newline-delimited
+//! [Model Context Protocol](https://modelcontextprotocol.io) over stdio or Streamable HTTP:
 //! JSON-RPC 2.0, hand-written (no async runtime). The server exposes VectorCraft as a set of MCP
 //! tools and resources and forwards everything to a [`Backend`]:
 //!
@@ -11,11 +11,14 @@
 //!   control-channel method names itself (rendering screenshots with `vectorcraft-render`), so agents
 //!   can draw and look at the result without a window.
 //!
-//! Entry points: [`Server::serve`] (stdio loop) and [`Server::handle_line`] (one message).
+//! Entry points: [`Server::serve`] (stdio loop), [`http::serve`] (Streamable HTTP), and
+//! [`Server::handle_line`] (one message).
 #![forbid(unsafe_code)]
 
 mod backend;
 mod headless;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod http;
 mod intake;
 pub mod logging;
 mod prompts;
