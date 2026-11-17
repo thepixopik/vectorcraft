@@ -34,6 +34,12 @@
 </head>
 <body>
   <canvas id="vectorcraft_canvas"></canvas>
-  <div id="vectorcraft_loading">Loading The AllCraft&hellip;</div>
+  <div id="vectorcraft_loading">
+    <div id="vc_load_label" style="margin-bottom:12px;font-size:15px;font-weight:600;color:#e6e6e6">Loading The AllCraft&hellip;</div>
+    <div style="width:240px;height:5px;background:#3a3a3a;border-radius:999px;overflow:hidden">
+      <div id="vc_load_bar" style="width:2%;height:100%;background:#E8573F;border-radius:999px;transition:width 0.12s ease-out"></div>
+    </div>
+    <div id="vc_load_pct" style="margin-top:8px;font-size:12px;color:#9a9a9a;font-variant-numeric:tabular-nums">Starting&hellip;</div>
+  </div>
 </body>
 </html>
