@@ -1,0 +1,54 @@
+# Unified Cloudflare Pages _headers for The AllCraft Studio (/, /vector/*, /photo/*)
+
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+
+# Entry HTML pages: revalidate on every visit so updates appear immediately
+/
+  Cache-Control: no-cache
+
+/index.html
+  Cache-Control: no-cache
+
+/vector/
+  Cache-Control: no-cache
+
+/vector/index.html
+  Cache-Control: no-cache
+
+/photo/
+  Cache-Control: no-cache
+
+/photo/index.html
+  Cache-Control: no-cache
+
+# PhotoCraft unhashed loader & part list must always revalidate
+/photo/app/photocraft-web.js
+  Cache-Control: no-cache
+
+/photo/app/parts.txt
+  Cache-Control: no-cache
+
+# VectorCraft & PhotoCraft hashed/chunked Wasm & JS assets: cache for 1 year
+/vector/*.wasm
+  Content-Type: application/wasm
+  Cache-Control: public, max-age=31536000, immutable
+
+/vector/*.part*
+  Content-Type: application/octet-stream
+  Cache-Control: public, max-age=31536000, immutable
+
+/vector/*.js
+  Cache-Control: public, max-age=31536000, immutable
+
+/photo/*.wasm
+  Content-Type: application/wasm
+  Cache-Control: public, max-age=31536000, immutable
+
+/photo/*.js
+  Cache-Control: public, max-age=31536000, immutable
+
+/photo/app/*.part-*
+  Content-Type: application/octet-stream
+  Cache-Control: public, max-age=31536000, immutable
