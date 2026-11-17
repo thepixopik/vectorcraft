@@ -1,13 +1,9 @@
-# Build with: trunk build --release   (from apps/vectorcraft-web)
 [build]
 target = "index.html"
 dist = "../../dist/web"
+# Relative asset URLs so the bundle works from a sub-path as well as a domain root.
 public_url = "./"
 filehash = true
-
-[serve]
-addresses = ["127.0.0.1"]
-port = 8766
 
 # Copy the craft-fonts faces web builds fetch (crates/text/web-fonts.txt) into the site's fonts/
 # folder; a no-op without CRAFT_FONTS_DIR. Runs for `trunk serve` and `trunk build`, through cargo so
@@ -16,3 +12,10 @@ port = 8766
 stage = "post_build"
 command = "cargo"
 command_arguments = ["xtask", "web-fonts"]
+
+# Compress and split release .wasm assets into <=15 MiB gzip parts so Cloudflare Pages' 25 MiB
+# single-file limit is never exceeded, with streaming browser decompression in index.html.
+[[hooks]]
+stage = "post_build"
+command = "python3"
+command_arguments = ["pack_wasm.py"]
